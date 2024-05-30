@@ -1,0 +1,322 @@
+import requests
+from google.oauth2.service_account import Credentials
+import gspread
+import csv
+import os
+from datetime import datetime
+import warnings
+
+# Suppress any deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Define the scope for Google Sheets API
+scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+# Authorize the credentials for Google API
+creds = Credentials.from_service_account_file('/home/murilo/Documents/Projetos/Python/Metrics/service_account.json', scopes=scopes)
+client = gspread.authorize(creds)
+
+# Open the spreadsheet and the specific worksheet
+spreadsheet = client.open_by_key("1wEKD3a9ell7BCisF3dn4TOoKcOS8zdYNa0j8qApc1Lo")
+worksheet = spreadsheet.worksheet("OPEN")  # Replace with your actual worksheet name
+
+# Read environment variables from a file
+with open('/home/murilo/Documents/Projetos/Python/Metrics/env_vars.sh') as f:
+    for line in f:
+        if '=' in line:
+            key, value = line.strip().split('=', 1)
+            os.environ[key] = value
+
+# Constants for JIRA and Slack
+JIRA_URL = os.environ.get("JIRA_URL")
+JIRA_TOKEN = os.environ.get("JIRA_TOKEN")
+STATUSES_ORDER = ['In Progress', 'Ready for Review', 'In Review', 'Ready for Test', 'In Testing']
+JIRA_HEADERS = {
+    "Authorization": f"Bearer {JIRA_TOKEN}",
+    "Content-Type": "application/json"
+}
+JQL=os.environ.get("JQL") #resolutionDate >= startOfDay(-90) AND resolutionDate <= endOfDay(-1)
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+
+# Google Sheets configurations from environment variables
+SHEET_ID = os.environ.get("SHEET_ID")
+SHEET_NAME = os.environ.get("SHEET_NAME")
+CREDENTIALS_FILE = os.environ.get("CREDENTIALS_FILE")
+
+# Define the field names for the data structure
+fieldnames = [
+    "key", "summary", "status", "issue_id", "issue_type", "priority",
+    "created", "resolved", "story_points", "time_spent", "epic_link", 
+    "assignee_name", "lead_time", "In Progress", "Ready for Review", 
+    "In Review", "Ready for Test", "In Testing"
+]
+
+# Ensure unique headers in the Google Sheet to avoid conflicts
+def ensure_unique_headers(worksheet):
+    headers = worksheet.row_values(1)
+    unique_headers = set()
+    for index, header in enumerate(headers):
+        if header in unique_headers:
+            headers[index] = f"{header}_{index}"
+        unique_headers.add(header)
+    worksheet.update('A1', [headers])
+
+# Fetch changes from JIRA using the provided JQL query
+def fetch_jira_changes():
+    params = {"jql": JQL, "expand": "changelog"}
+    response = requests.get(JIRA_URL, headers=JIRA_HEADERS, params=params)
+    if response.status_code != 200:
+        error_message = f"Error fetching data from JIRA. Status Code: {response.status_code}, Response: {response.text}"
+        send_to_slack(error_message)
+        return None
+    print(f"Fetched {len(response.json().get('issues', []))} issues from JIRA.")
+    return response.json().get("issues", [])
+
+# Function to extract all status changes from the JIRA changelog
+def extract_all_status_changes(issue):
+    """
+    Extracts all status changes from the changelog of a JIRA issue.
+    Returns a dictionary with statuses as keys and their change dates as values.
+    """
+    status_changes = {}
+    # Ensure the 'changelog' exists in the issue
+    if 'changelog' in issue:
+        changelog = issue.get("changelog", {}).get("histories", [])
+        for history in changelog:
+            for item in history.get("items", []):
+                if item.get("field") == "status":
+                    status_name = item.get("toString")
+                    # Check if the status name is one of the statuses we're interested in
+                    if status_name in STATUSES_ORDER:
+                        # Parse the date and add it to the status_changes dictionary
+                        date_str = history.get("created")
+                        parsed_date = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.%f%z').strftime('%d/%m/%Y')
+                        status_changes[status_name] = parsed_date
+                        # Debug print to check what's being processed
+                        print(f"Status change found: {status_name} on {parsed_date}")
+    else:
+        # If no changelog is found, print a debug message
+        print(f"No changelog found for issue {issue.get('key')}")
+
+    return status_changes
+
+# Transform the raw JIRA issue data into a structured format
+def transform_jira_issue(issue):
+    # Process each field and convert dates to a readable format
+    key = issue.get("key", "No Key")
+    summary = issue["fields"].get("summary", "No Summary")
+    status = issue["fields"].get("status", {}).get("name", "No Status")
+    issue_id = issue.get("id", "No ID")
+    issue_type = issue["fields"].get("issuetype", {}).get("name", "No Issue Type")
+    priority = issue["fields"].get("priority", {}).get("name", "No Priority")
+    
+    # Transform 'created' date
+    created_str = issue["fields"].get("created", "Not Created")
+    if created_str != "Not Created":
+       created = datetime.strptime(created_str, '%Y-%m-%dT%H:%M:%S.%f%z').strftime('%d/%m/%Y')
+    else:
+        created = "Not Created"
+    
+    # Transform 'resolved' date
+    resolved_str = issue["fields"].get("resolutiondate")
+    if resolved_str:
+        resolved = datetime.strptime(resolved_str, '%Y-%m-%dT%H:%M:%S.%f%z').strftime('%d/%m/%Y')
+    else:
+        resolved = ""
+    
+    # Calculate lead_time
+    created_date_obj = datetime.strptime(created_str, '%Y-%m-%dT%H:%M:%S.%f%z')
+    if resolved_str:
+        resolved_date_obj = datetime.strptime(resolved_str, '%Y-%m-%dT%H:%M:%S.%f%z')
+        lead_time = (resolved_date_obj - created_date_obj).days
+    else:
+        lead_time = None
+
+    story_points = issue["fields"].get("customfield_10002", None) 
+    time_spent = issue["fields"].get("timespent", None)
+    epic_link = issue["fields"].get("customfield_10005", None)
+    assignee = issue["fields"].get("assignee")
+    assignee_name = assignee.get("displayName", "No Assignee") if assignee else "No Assignee"
+  
+    # Return the transformed issue data
+
+    return {
+        "key": key,
+        "summary": summary,
+        "status": status,
+        "issue_id": issue_id,
+        "issue_type": issue_type,
+        "priority": priority,
+        "created": created,
+        "resolved": resolved,
+        "story_points": story_points,
+        "time_spent": time_spent,
+        "epic_link": epic_link,
+        "assignee_name": assignee_name,
+        "lead_time": lead_time
+    }
+    
+    # This should be your list of rows to append
+    new_rows = [...]  # This should be your list of rows to append
+
+    # Now, calculate the number of rows to append
+    num_rows_to_append = len(new_rows)
+
+    # Your existing logic for appending rows
+    if num_rows_to_append > 0:
+        print(f"Attempting to append {num_rows_to_append} rows to the sheet...")
+        worksheet.append_rows(new_rows, value_input_option='USER_ENTERED')
+        print(f"{num_rows_to_append} rows appended successfully.")
+    else:
+        print("No new rows to add.")
+
+# Function to update the Google Sheet with the latest changes from JIRA
+def update_google_sheet(csv_data, fieldnames, worksheet):
+    altered_fields_messages = []  # Initialize an empty list to collect messages
+    try:
+        all_values = worksheet.get_all_values()
+        print(f"All values in sheet: {all_values}")
+
+        # Check if there are more than just header rows
+        if len(all_values) > 1:
+            # Fetch the existing data from the worksheet
+            cell_list = worksheet.range('A2:A' + str(worksheet.row_count))
+            existing_values = worksheet.get_all_records()
+            
+            # Create a list to hold the row numbers starting from the second row
+            row_numbers = [cell.row for cell in cell_list if cell.value]
+            
+            # Convert the existing values to a dictionary keyed by the 'key' field and include the row number
+            existing_data = {row['key']: (row, row_number) for row, row_number in zip(existing_values, row_numbers)}
+            
+            rows_to_update = []
+            for row in csv_data:
+                key = row['key']
+                existing_row, row_number = existing_data.get(key, (None, None))
+                
+                # If the row exists, check for changes
+                if existing_row:
+                    altered_fields = []
+                    for field in fieldnames:
+                        if str(existing_row.get(field, '')) != str(row.get(field, '')):
+                            altered_fields.append(field)
+                    if altered_fields:
+                        updated_row = [row.get(field, '') for field in fieldnames]
+                        rows_to_update.append((row_number, updated_row))
+                        altered_fields_messages.append(f"Key '{key}' altered fields: {', '.join(altered_fields)}")
+
+            # Perform the updates
+            for row_number, row_values in rows_to_update:
+                range_expression = f'A{row_number}:{chr(64+len(fieldnames))}{row_number}'
+                worksheet.update(range_expression, [row_values])
+
+        else:
+            print("No data rows found in the sheet, only headers.")
+
+    except gspread.exceptions.GSpreadException as e:
+        print(f"Failed to fetch existing records: {e}")
+
+    # After all updates are prepared, print all messages at once
+    for message in altered_fields_messages:
+        print(message)
+
+# Function to append new rows to the Google Sheet
+def write_to_google_sheet(data, fieldnames, worksheet):
+    # Append new rows if they don't exist in the sheet already
+    client = gspread.authorize(creds)
+    spreadsheet = client.open("import test")
+    worksheet = spreadsheet.worksheet("OPEN")
+
+    try:
+        existing_values = worksheet.get_all_values()
+        headers = existing_values[0]
+        existing_data = [dict(zip(headers, row)) for row in existing_values[1:] if any(row)]
+        existing_keys = [row['key'] for row in existing_data if 'key' in row]
+
+        new_rows = []
+        for row in data:
+            if row['key'] not in existing_keys:
+                new_row = [row.get(field, "") for field in fieldnames]
+                new_rows.append(new_row)
+                num_rows_to_append = len(new_rows)  # Calculate the number of new rows
+
+        # Instead of printing inside the loop, check if there are new rows to add after the loop
+        if new_rows:
+            worksheet.append_rows(new_rows, value_input_option='USER_ENTERED')
+            print(f"{num_rows_to_append} rows appended successfully.")
+        else:
+            print("No new rows to add.")
+
+    except Exception as e:
+        print(f"An error occurred while appending rows: {e}")
+
+# Function to send messages to Slack
+def send_to_slack(message, file_path=None):
+    slack_data = {"text": message}
+    if file_path:
+        with open(file_path, "r") as file:
+            file_content = file.read()
+        if len(file_content) > 4000:
+            file_content = file_content[:3950] + "\n... [Content Truncated]"
+        slack_data["text"] += f"\n```{file_content}```\nFile Path: {file_path}"
+    response = requests.post(SLACK_WEBHOOK_URL, json=slack_data)
+    if response.status_code != 200:
+        print(f"Failed to send Slack message. Status Code: {response.status_code}, Response: {response.text}")
+
+# Main function to process JIRA issues and update the Google Sheet and CSV file
+def main():
+    global fieldnames
+    # Fetch the latest changes from JIRA
+    issues = fetch_jira_changes()
+    if not issues:
+        return
+
+    # Ensure that the headers in the sheet are unique to avoid conflicts
+    ensure_unique_headers(worksheet)
+
+    # Initialize data for writing to CSV
+    csv_data = []
+
+    # Process JIRA issues and transform data
+    for issue in issues:
+        row_data = transform_jira_issue(issue)
+        # Extract status changes and merge them with row_data
+        status_changes = extract_all_status_changes(issue)
+        row_data.update(status_changes)  # Merge status changes into row_data
+        csv_data.append(row_data)
+
+    # Update existing issues in the Google Sheet with any new changes
+    update_google_sheet(csv_data, fieldnames, worksheet)
+
+    # The following loops should be correctly indented inside the main() function
+    for row in csv_data:
+        if not row.get('In Progress') and row.get('Status') not in ["To Do", "Selected for Development"]:
+            row['In Progress'] = row.get('Created', '')
+
+        for i in range(len(STATUSES_ORDER) - 1):
+            if not row.get(STATUSES_ORDER[i]):
+                for j in range(i + 1, len(STATUSES_ORDER)):
+                    if row.get(STATUSES_ORDER[j]):
+                        row[STATUSES_ORDER[i]] = row[STATUSES_ORDER[j]]
+                        break
+
+        if row.get('status') == 'Done' and row.get('resolved'):
+            for status in STATUSES_ORDER[2:5]:  # ["Ready for Review", "In Review", "Ready for Test", "In Testing"]
+                if not row.get(status):
+                    row[status] = row['resolved']
+
+    # Write to CSV
+    with open('/home/murilo/Documents/Status/output.csv', 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in csv_data:
+            writer.writerow(row)
+
+    print("File generation complete!")
+
+    # Append new rows to the Google Sheet, make sure this is called only once
+    write_to_google_sheet(csv_data, fieldnames, worksheet)
+
+# Call the main function if the script is run directly
+if __name__ == "__main__":
+    main()
